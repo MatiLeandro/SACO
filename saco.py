@@ -114,14 +114,46 @@ def parse_args():
     parser.add_argument('-o', '--output', default=DEFAULT_OUTPUT,
                         help=f'archivo de salida (default: {DEFAULT_OUTPUT})')
     parser.add_argument('-i', '--ignore', action='append', default=[],
-                        help='patrón adicional a ignorar (repeatable)')
+                        help='patrón adicional (comma-separated: -i "*.log, tmp/")')
+    parser.add_argument('-r', '--replace-ignore', action='store_true',
+                        help='descarta built-ins, .gitignore y .saco/ignore.txt')
+    parser.add_argument('-l', '--lang', action='append', default=[],
+                        help='inyecta/sobrescribe extensión (.py:python3)')
+    parser.add_argument('--replace-lang', action='store_true',
+                        help='vacía LANG_MAP entero, solo usa -l')
+    parser.add_argument('--eject', choices=['local', 'global'], default=None,
+                        help='crea .saco/ en cwd (local) o junto al script (global)')
+    parser.add_argument('--priority', choices=['local', 'global'], default='local',
+                        help='invierte prioridad local↔global (default: local)')
     parser.add_argument('--root', default='.',
                         help='directorio raíz a escanear (default: .)')
     parser.add_argument('--no-gitignore', action='store_true',
                         help='ignorar .gitignore del proyecto')
+    parser.add_argument('--force', action='store_true',
+                        help='permite sobrescribir .saco/ existente en --eject')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='mostrar progreso en stderr')
     return parser.parse_args()
+
+
+def eject_config(target_dir: Path, force: bool):
+    saco_dir = target_dir / '.saco'
+    if saco_dir.exists() and not force:
+        print(f'Error: {saco_dir} already exists. Use --force to overwrite.',
+              file=sys.stderr)
+        sys.exit(1)
+    saco_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(saco_dir / 'ignore.txt', 'w') as f:
+        for pattern in BUILTIN_IGNORE:
+            f.write(pattern + '\n')
+
+    with open(saco_dir / 'languages.txt', 'w') as f:
+        for ext, lang in sorted(LANG_MAP.items()):
+            f.write(f'{ext}:{lang}\n')
+
+    print(f'[saco] configuration ejected to {saco_dir}', file=sys.stderr)
+    sys.exit(0)
 
 
 def ensure_output_is_ignored(output_name: str):
@@ -153,6 +185,59 @@ def load_gitignore_patterns(root: Path):
         for line in f:
             lines.append(line.rstrip('\n'))
     return lines
+
+
+def load_ignore_file(path: Path):
+    lines = []
+    with path.open('r', errors='replace') as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped:
+                lines.append(stripped)
+    return lines
+
+
+def load_languages_file(path: Path):
+    mapping = {}
+    with path.open('r', errors='replace') as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped and ':' in stripped:
+                ext, lang = stripped.split(':', 1)
+                mapping[ext.strip()] = lang.strip()
+    return mapping
+
+
+def load_config_cascade(args, script_dir):
+    cwd_saco = Path.cwd() / '.saco'
+    script_saco = script_dir / '.saco'
+
+    if args.priority == 'global':
+        primary, secondary = script_saco, cwd_saco
+        primary_name, secondary_name = 'global', 'local'
+    else:
+        primary, secondary = cwd_saco, script_saco
+        primary_name, secondary_name = 'local', 'global'
+
+    file_ignore_patterns = []
+    for d, name in [(primary, primary_name), (secondary, secondary_name)]:
+        ignore_file = d / 'ignore.txt'
+        if ignore_file.exists():
+            file_ignore_patterns = load_ignore_file(ignore_file)
+            print(f'[saco] using ignore.txt from .saco/ ({name})',
+                  file=sys.stderr)
+            break
+
+    file_lang_map = {}
+    for d, name in [(primary, primary_name), (secondary, secondary_name)]:
+        lang_file = d / 'languages.txt'
+        if lang_file.exists():
+            file_lang_map = load_languages_file(lang_file)
+            print(f'[saco] using languages.txt from .saco/ ({name})',
+                  file=sys.stderr)
+            break
+
+    return file_ignore_patterns, file_lang_map
 
 
 def parse_gitignore_line(raw_line: str):
@@ -237,18 +322,25 @@ def _gitignore_to_regex(pattern: str, anchored: bool, dir_only: bool):
     return re.compile('^' + regex + '$')
 
 
-def compile_ignore_patterns(builtins, gitignore_raw, cli_patterns, output_name):
+def compile_ignore_patterns(builtins, gitignore_raw, file_ignore_patterns,
+                            cli_patterns, output_name, replace_ignore=False):
     all_patterns = []
 
-    for p in builtins:
-        parsed = parse_gitignore_line(p)
-        if parsed:
-            all_patterns.append(parsed)
+    if not replace_ignore:
+        for p in builtins:
+            parsed = parse_gitignore_line(p)
+            if parsed:
+                all_patterns.append(parsed)
 
-    for line in gitignore_raw:
-        parsed = parse_gitignore_line(line)
-        if parsed:
-            all_patterns.append(parsed)
+        for line in gitignore_raw:
+            parsed = parse_gitignore_line(line)
+            if parsed:
+                all_patterns.append(parsed)
+
+        for p in file_ignore_patterns:
+            parsed = parse_gitignore_line(p)
+            if parsed:
+                all_patterns.append(parsed)
 
     for p in cli_patterns:
         parsed = parse_gitignore_line(p)
@@ -313,8 +405,8 @@ def collect_file_paths(root: Path, patterns: list):
         yield path
 
 
-def detect_language(suffix: str):
-    return LANG_MAP.get(suffix.lower(), '')
+def detect_language(suffix: str, lang_map: dict):
+    return lang_map.get(suffix.lower(), '')
 
 
 def stream_file_content(f_out, path: Path, chunk_size=65536):
@@ -384,16 +476,17 @@ def write_directory_tree(f_out, root: Path, paths: list):
     f_out.write('\n---\n\n')
 
 
-def write_file_section(f_out, path: Path, root: Path):
+def write_file_section(f_out, path: Path, root: Path, lang_map: dict):
     rel = path.relative_to(root)
-    lang = detect_language(path.suffix)
+    lang = detect_language(path.suffix, lang_map)
     f_out.write(f'## {rel}\n\n')
     f_out.write(f'```{lang}\n')
     stream_file_content(f_out, path)
     f_out.write('\n```\n\n')
 
 
-def write_output(root: Path, paths: list, output_path: str, verbose: bool):
+def write_output(root: Path, paths: list, output_path: str, verbose: bool,
+                 lang_map: dict):
     total_size = sum(p.stat().st_size for p in paths)
 
     with open(output_path, 'w', encoding='utf-8', buffering=1) as f:
@@ -403,7 +496,7 @@ def write_output(root: Path, paths: list, output_path: str, verbose: bool):
         for path in paths:
             if verbose:
                 print(path.relative_to(root), file=sys.stderr)
-            write_file_section(f, path, root)
+            write_file_section(f, path, root, lang_map)
 
     if verbose:
         print(
@@ -414,20 +507,45 @@ def write_output(root: Path, paths: list, output_path: str, verbose: bool):
 
 def main():
     args = parse_args()
-    root = Path(args.root).resolve()
+    script_dir = Path(__file__).resolve().parent
 
+    if args.eject:
+        target = Path.cwd() if args.eject == 'local' else script_dir
+        eject_config(target, args.force)
+
+    root = Path(args.root).resolve()
     if not root.exists():
         print(f'Error: el directorio {root} no existe', file=sys.stderr)
         sys.exit(1)
 
     ensure_output_is_ignored(DEFAULT_OUTPUT)
 
+    file_ignore_patterns, file_lang_map = load_config_cascade(args, script_dir)
+
+    if args.replace_lang:
+        merged_lang_map = {}
+    else:
+        merged_lang_map = LANG_MAP.copy()
+        merged_lang_map.update(file_lang_map)
+
+    if args.lang:
+        for entry in args.lang:
+            if ':' in entry:
+                ext, lang = entry.split(':', 1)
+                merged_lang_map[ext.strip()] = lang.strip()
+
     gitignore_raw = load_gitignore_patterns(root) if not args.no_gitignore else []
-    builtins = BUILTIN_IGNORE.copy()
-    patterns = compile_ignore_patterns(builtins, gitignore_raw, args.ignore, args.output)
+
+    cli_patterns = []
+    for p in args.ignore:
+        cli_patterns.extend([part.strip() for part in p.split(',')])
+
+    patterns = compile_ignore_patterns(
+        BUILTIN_IGNORE, gitignore_raw, file_ignore_patterns,
+        cli_patterns, args.output, args.replace_ignore)
 
     paths = list(collect_file_paths(root, patterns))
-    write_output(root, paths, args.output, args.verbose)
+    write_output(root, paths, args.output, args.verbose, merged_lang_map)
 
 
 if __name__ == '__main__':
